@@ -1,6 +1,6 @@
 #!/bin/bash
 # ===========================================================
-# stop_all.sh – Beendet alle Skripte und mpv-Prozesse
+# stop_all.sh – Beendet alle Skripte, Services und mpv-Prozesse
 # auf Master + Clients
 # ===========================================================
 
@@ -15,19 +15,23 @@ echo "Startzeit: $(date)"
 echo "==================================================="
 
 for host in "${HOSTS[@]}"; do
+  CLIENT_ID=$(echo "$host" | sed -E 's/.*computer([0-9]{2})@.*/\1/')
   echo "→ Verbinde zu $host ..."
-  ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" '
+  if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" CLIENT_ID="$CLIENT_ID" 'bash -s' <<'EOS'; then
+    echo "⚠️ Verbindung zu $host fehlgeschlagen."
+    continue
+EOS
     echo "[STOP] Beende Prozesse auf $(hostname)..."
-    # Alle mpv-Instanzen beenden
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl --user stop "improved_client@${CLIENT_ID}.service" >/dev/null 2>&1 || true
+    fi
     pkill -f "mpv" 2>/dev/null || true
-    # Alle improved_* Skripte beenden
     pkill -f "improved_master.sh" 2>/dev/null || true
     pkill -f "improved_client.sh" 2>/dev/null || true
-    # Optional: inotifywait (Client-Dateiüberwachung)
     pkill -f "inotifywait" 2>/dev/null || true
-    sleep 0.3
     echo "[STOP] Fertig auf $(hostname)."
-  ' || echo "⚠️ Verbindung zu $host fehlgeschlagen."
+EOS
+  fi
 done
 
 echo

@@ -45,25 +45,65 @@ BLACK_IMG="/tmp/black.ppm"
 sock_path(){ printf "/tmp/mpv_client%d_%s.sock" "$CLIENT_ID" "$1"; }
 wait_for_socket(){ local s="$1" t=0; while [[ ! -S "$s" && $t -lt 30 ]]; do sleep 0.1; ((t++)); done; [[ -S "$s" ]]; }
 
+declare -a MPV_PIDS CURRENT_IMAGES
+
+mpv_cmd(){
+  mpv --no-terminal --really-quiet --idle=yes --keep-open=yes \
+    --no-config --no-border --fs --force-window=yes \
+    --geometry="$1" --image-display-duration=0 --osc=no --osd-level=0 \
+    --input-ipc-server="$2" "$BLACK_IMG"
+}
+
+start_single_mpv(){
+  local idx="$1" s g pid
+  s="$(sock_path "$idx")"
+  g="${CLIENT_GEOMETRIES[$idx]}"
+  [[ -S "$s" ]] && rm -f "$s"
+  mpv_cmd "$g" "$s" >/dev/null 2>&1 &
+  pid=$!
+  MPV_PIDS[$idx]=$pid
+  log "mpv[$idx] gestartet (PID=$pid, Socket=$s)"
+  wait_for_socket "$s" || log "WARN: Socket $s tauchte nicht auf"
+}
+
 ipc_loadfile(){
   local idx="$1" img="$2" s; s="$(sock_path "$idx")"
   wait_for_socket "$s" || return
   [[ -f "$img" ]] || img="$BLACK_IMG"
   printf '{ "command": ["loadfile", "%s", "replace"] }\n' "$img" \
     | socat - "UNIX-CONNECT:$s" >/dev/null 2>&1 || true
+  CURRENT_IMAGES[$idx]="$img"
 }
 
 start_mpv(){
   for i in $(seq 0 $((MONITORS_PER_CLIENT-1))); do
-    local s g; s="$(sock_path "$i")"; g="${CLIENT_GEOMETRIES[$i]}"
-    [[ -S "$s" ]] && rm -f "$s"
-    nohup mpv --no-terminal --really-quiet --idle=yes --keep-open=yes \
-      --no-border --geometry="$g" --fs --force-window=yes \
-      --image-display-duration=0 --osc=no --osd-level=0 \
-      --input-ipc-server="$s" "$BLACK_IMG" >/dev/null 2>&1 &
-    sleep 0.15
+    start_single_mpv "$i"
+    sleep 0.1
   done
   sleep 1
+}
+
+ping_socket(){
+  local s="$(sock_path "$1")"
+  [[ -S "$s" ]] || return 1
+  printf '{ "command": ["get_property", "idle-active"] }\n' |
+    socat - "UNIX-CONNECT:$s" >/dev/null 2>&1
+}
+
+ensure_mpv(){
+  local idx
+  for idx in $(seq 0 $((MONITORS_PER_CLIENT-1))); do
+    if [[ ! -S "$(sock_path "$idx")" ]] || ! ping_socket "$idx"; then
+      log "WARN: mpv[$idx] reagiert nicht – Neustart"
+      if [[ -n "${MPV_PIDS[$idx]:-}" ]]; then
+        kill "${MPV_PIDS[$idx]}" >/dev/null 2>&1 || true
+        wait "${MPV_PIDS[$idx]}" 2>/dev/null || true
+      fi
+      start_single_mpv "$idx"
+      sleep 0.1
+      ipc_loadfile "$idx" "${CURRENT_IMAGES[$idx]:-$BLACK_IMG}"
+    fi
+  done
 }
 
 LAST_TS=0
@@ -100,27 +140,52 @@ show_playlist(){
   done
 }
 
-cleanup(){ pkill -u "$(id -u)" -f "mpv.*mpv_client${CLIENT_ID}_" >/dev/null 2>&1 || true; }
+cleanup(){
+  for pid in "${MPV_PIDS[@]}"; do
+    [[ -n "$pid" ]] && kill "$pid" >/dev/null 2>&1 || true
+  done
+  pkill -u "$(id -u)" -f "mpv.*mpv_client${CLIENT_ID}_" >/dev/null 2>&1 || true
+}
 trap cleanup EXIT
 
-# --------- Start ---------
-log "Starte Client${CLIENT_ID}"
-mkdir -p "$IMAGE_DIR"
-start_mpv
-show_playlist
-
-last_update=0
-while true; do
-  if inotifywait -e close_write --quiet "$(dirname "$PLAYLIST_FILE")" >/dev/null 2>&1; then
-    if [[ -s "$PLAYLIST_FILE" ]]; then
-      now=$(date +%s)
-      (( now - last_update < 1 )) && continue
-      last_update=$now
-      log "Playlist aktualisiert"
-      show_playlist
-    fi
-  else
-    # Falls inotifywait fehlschlägt, kurz warten und neu versuchen
-    sleep 1
+# --------- Hauptlogik ---------
+poll_playlist(){
+  local mtime
+  mtime=$(stat -c %Y "$PLAYLIST_FILE" 2>/dev/null || echo 0)
+  if (( mtime > PLAYLIST_MTIME )); then
+    PLAYLIST_MTIME=$mtime
+    log "Playlist-Änderung erkannt (Polling)"
+    show_playlist
   fi
-done
+}
+
+main(){
+  trap cleanup EXIT
+
+  log "Starte Client${CLIENT_ID}"
+  mkdir -p "$IMAGE_DIR"
+  start_mpv
+  show_playlist
+
+  last_update=0
+  PLAYLIST_MTIME=$(stat -c %Y "$PLAYLIST_FILE" 2>/dev/null || echo 0)
+
+  while true; do
+    ensure_mpv
+    if inotifywait -e close_write --quiet "$(dirname "$PLAYLIST_FILE")" >/dev/null 2>&1; then
+      if [[ -s "$PLAYLIST_FILE" ]]; then
+        now=$(date +%s)
+        (( now - last_update < 1 )) && continue
+        last_update=$now
+        log "Playlist aktualisiert"
+        show_playlist
+      fi
+    else
+      # Falls inotifywait fehlschlägt, kurz warten, Polling-Fallback nutzen
+      sleep 1
+      poll_playlist
+    fi
+  done
+}
+
+main "$@"
