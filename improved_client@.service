@@ -1,0 +1,17 @@
+[Unit]
+Description=Improved Exhibition Client %i
+After=graphical-session.target default.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=%h/.Xauthority
+Environment=CLIENT_ID=%i
+ExecStart=%h/improved_client.sh
+Restart=always
+RestartSec=2
+WorkingDirectory=%h
+
+[Install]
+WantedBy=default.target
