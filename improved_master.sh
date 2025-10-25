@@ -32,6 +32,10 @@ CLIENT_HOSTS=("localhost"  "192.168.1.2" "192.168.1.3" "192.168.1.4")
 BLACK_SLOTS_MODE="prob"   # aktuell nur "prob" unterstützt
 BLACK_SLOT_PROB="0.00"    # 0.0–1.0: Wahrscheinlichkeit je Slot, schwarz zu bleiben
 
+# Globale Bildliste (von get_images gefüllt)
+declare -ag IMAGES
+
+
 # Bilder-Sync
 SYNC_IMAGES=true           # auf true lassen, wenn rsync genutzt werden soll
 SYNC_EVERY=30              # alle N Sekunden Bilder syncen (wenn SYNC_IMAGES=true)
@@ -154,11 +158,15 @@ show_on_master(){
 }
 
 # ----------------- Bildauswahl & Sync -----------------
-get_images(){
+get_images() {
   # Globale Ausgabe: IMAGES=() mit bis zu 16 Dateinamen
   local ALL=() SHUF=()
-  mapfile -t ALL < <(find "$IMAGE_DIR" -maxdepth 1 -type f -iregex '.*\.\(jpe?g\|png\|bmp\|gif\)$' \
-                    | xargs -I{} basename "{}" | sort)
+  # Dateiliste robust (Basename direkt aus find)
+  mapfile -t ALL < <(
+    find "$IMAGE_DIR" -maxdepth 1 -type f \
+      \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.bmp' -o -iname '*.gif' \) \
+      -printf '%f\n' | sort
+  )
   local total=${#ALL[@]}
   log "Gefundene Bilder gesamt: $total"
   if (( total == 0 )); then
@@ -175,13 +183,15 @@ get_images(){
   local need=$(( MONITORS_PER_CLIENT * ${#CLIENT_HOSTS[@]} ))  # i.d.R. 16
   local n=$(( need<${#SHUF[@]} ? need : ${#SHUF[@]} ))
 
-  # WICHTIG: global setzen (kein 'local'!
-  IMAGES=( "${SHUF[@]:0:n}" )
+  # WICHTIG: global setzen (KEIN 'local'!)
+  IMAGES=( "${_SHUF[@]:0:need}" )
 
-  # kurzer Debug: wie viele gehen ins Schreiben?
+  # Debug: Anzahl + die ersten 4 Namen
   log "Tick-Auswahl: ${#IMAGES[@]} Dateien (Need=$need, Seed=$seed)"
+  ((${#IMAGES[@]})) && log "Tick-Preview[0..3]: ${IMAGES[*]:0:4}"
   return 0
 }
+
 
 
 RSYNC_OPTS="${RSYNC_OPTS:--az --delete --inplace}"
@@ -207,9 +217,10 @@ sync_images_to_clients(){
 
 # ----------------- Playlists bauen & veröffentlichen -----------------
 publish_playlists(){
-  # Erwartet: IMAGES[], CLIENT_USERS[], CLIENT_HOSTS[], MONITORS_PER_CLIENT, MASTER_ID
   local idx CID CID_PAD user host build_tmp
   local i j mask_val
+
+  log "DEBUG publish: IMAGES.len=${#IMAGES[@]}"
 
   for idx in "${!CLIENT_HOSTS[@]}"; do
     CID=$((idx+1))
@@ -217,30 +228,76 @@ publish_playlists(){
     user="${CLIENT_USERS[$idx]}"
     host="${CLIENT_HOSTS[$idx]}"
 
-    # Build-Datei lokal erzeugen
+    # tmp-Datei bauen
     build_tmp="$(mktemp "/tmp/.playlist_build_${CID_PAD}.XXXXXX" 2>/dev/null || echo "/tmp/.playlist_build_${CID_PAD}.$$")" || continue
     : >"$build_tmp" || { log "WARN: konnte $build_tmp nicht schreiben"; continue; }
 
     # Kopf (Timestamp)
     printf '%s\n' "$(date +%s)" >"$build_tmp"
 
-    # Schwarz-Maske für diesen Client wählen (m0..m3; 1=schwarz, 0=bild)
+    # Maske wählen (bei BLACK_SLOT_PROB=0.00 → 0 0 0 0)
     read -r m0 m1 m2 m3 < <( choose_black_mask_for_client )
 
-    # Slots 0..3 schreiben (leer = schwarz; sonst Bild aus IMAGES)
-    for i in 0 1 2 3; do
-      j=$(( (CID-1)*MONITORS_PER_CLIENT + i ))
-      mask_val=$(eval "echo \$m$i")
-      if [[ "$mask_val" -eq 1 ]]; then
-        printf '\n' >>"$build_tmp"    # absichtlich schwarz
+      # vier Slots schreiben (schwarz nur bei Bedarf)
+  for i in 0 1 2 3; do
+    j=$(( (CID-1)*MONITORS_PER_CLIENT + i ))
+    mask_val=$(eval "echo \$m$i")   # wenn du das Schwarz‑Feature nutzt
+
+    if [[ "$mask_val" -eq 1 ]]; then
+      printf '\n' >>"$build_tmp"     # schwarz
+    else
+      if [[ $j -lt ${#IMAGES[@]} && -n "${IMAGES[$j]}" ]]; then
+        printf '%s\n' "${IMAGES[$j]}" >>"$build_tmp"
       else
-        if [[ $j -lt ${#IMAGES[@]} && -n "${IMAGES[$j]}" ]]; then
-          printf '%s\n' "${IMAGES[$j]}" >>"$build_tmp"
-        else
-          printf '\n' >>"$build_tmp"
-        fi
+        printf '\n' >>"$build_tmp"
       fi
-    done
+    fi
+  done
+
+    # --- ENDE Schreibblock ---
+
+    # Debug: wie viele nicht-leere Slots (Zeilen 2..5)?
+     local nonempty=0
+  while IFS= read -r ln; do [[ -n "$ln" ]] && ((nonempty++)); done < <(tail -n +2 "$build_tmp")
+  log "DEBUG: Client ${CID_PAD}: nicht‑leere Slots=$nonempty (von 4)"
+
+
+    # Deploy: Master lokal atomar + Symlink, andere per scp+mv+Symlink
+    local final_pad="/tmp/playlist_client${CID_PAD}.txt"
+    local final_unpad="/tmp/playlist_client${CID}.txt"
+
+    if [[ "$CID" -eq "$MASTER_ID" ]]; then
+      mv -f "$build_tmp" "$final_pad" 2>/dev/null || cp -f "$build_tmp" "$final_pad"
+      ln -sf "$final_pad" "$final_unpad"
+      rm -f "$build_tmp" >/dev/null 2>&1 || true
+      log "Playlist (Master) → $final_pad (Symlink: $final_unpad)"
+    else
+      local remote_tmp="/tmp/.playlist_client${CID_PAD}.tmp"
+      if scp -q "$build_tmp" "${user}@${host}:${remote_tmp}" >/dev/null 2>&1; then
+        if ssh -o BatchMode=yes -o ConnectTimeout=5 "${user}@${host}" \
+             "mv -f '$remote_tmp' '$final_pad' 2>/dev/null || cp -f '$remote_tmp' '$final_pad'; ln -sf '$final_pad' '$final_unpad'"; then
+          log "Playlist an ${user}@${host} → $final_pad (Symlink: $final_unpad)"
+        else
+          log "WARN: mv/ln auf ${user}@${host} fehlgeschlagen"
+        fi
+      else
+        log "WARN: SCP zu ${user}@${host} fehlgeschlagen"
+      fi
+      rm -f "$build_tmp" >/dev/null 2>&1 || true
+    fi
+  done
+
+  return 0
+}
+
+# --- Debug: wie viele nicht-leere Slots? ---
+local nonempty=0
+while IFS= read -r ln; do
+  [[ -n "$ln" ]] && ((nonempty++))
+done < <(tail -n +2 "$build_tmp")
+log "DEBUG: Client ${CID_PAD}: nicht-leere Slots=$nonempty (von 4)"
+
+
 
     # Master lokal deployen (atomar) + Symlink
     if [[ "$CID" -eq "$MASTER_ID" ]]; then
@@ -274,6 +331,7 @@ publish_playlists(){
 
   return 0
 }
+
 
 # ----------------- Hauptprogramm -----------------
 log "=== START improved_master.sh ==="
