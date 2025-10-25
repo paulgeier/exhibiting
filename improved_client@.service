@@ -1,17 +1,17 @@
+# ~/.config/systemd/user/improved_client@.service
 [Unit]
 Description=Improved Exhibition Client %i
-After=graphical-session.target default.target
-StartLimitIntervalSec=0
+After=graphical-session.target
 
 [Service]
 Type=simple
+Environment=CLIENT_ID=%i
 Environment=DISPLAY=:0
 Environment=XAUTHORITY=%h/.Xauthority
-Environment=CLIENT_ID=%i
 ExecStart=%h/improved_client.sh
 Restart=always
-RestartSec=2
-WorkingDirectory=%h
+RestartSec=1
+# Logs gehen ins Skript-eigene ~/logs/clientXX.log
 
 [Install]
 WantedBy=default.target
