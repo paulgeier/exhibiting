@@ -1,6 +1,16 @@
 # exhibiting
-
 Multimedia installation with 16 monitors and 4 PCs. This repository contains hardened shell scripts for distributing still images across a wall of displays using `mpv`, SSH and now user-level `systemd` services.
+
+> Distributed multimedia installation framework for synchronized 16-monitor art displays
+
+Turn a wall of screens into a synchronized, ever-changing visual experience.
+
+**Features:**
+- 🎨 Deterministic image distribution across 16 monitors
+- 🔄 Synchronized 10-second tick cycles
+- ⚫ Random black slot insertion for dynamic compositions
+- 🖥️ Master-client architecture with automatic failover
+- 🚀 Zero-downtime updates via systemd user services
 
 ## Components
 
